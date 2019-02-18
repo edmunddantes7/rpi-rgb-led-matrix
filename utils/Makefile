@@ -25,6 +25,9 @@ all : $(BINARIES)
 $(RGB_LIBRARY): FORCE
 	$(MAKE) -C $(RGB_LIBDIR)
 
+led-imager: led-imager.o $(RGB_LIBRARY)
+	$(CXX) $(CXXFLAGS) led-imager.o -o $@ $(LDFLAGS) $(MAGICK_LDFLAGS) $(DEBUGFLAGS)
+
 led-image-viewer: led-image-viewer.o $(RGB_LIBRARY)
 	$(CXX) $(CXXFLAGS) led-image-viewer.o -o $@ $(LDFLAGS) $(MAGICK_LDFLAGS) $(DEBUGFLAGS)
 
