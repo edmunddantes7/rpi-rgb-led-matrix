@@ -1,190 +1,342 @@
-#include "led-matrix.h"
-#include "pixel-mapper.h"
-#include "content-streamer.h"
-#include "mqtt/async_client.h"
+#include "ActionListener.h"
 
-#include <fcntl.h>
-#include <math.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
+// all globals.
+static struct State {
+	tmillis_t start_load = GetTimeInMillis();
 
-#include <algorithm>
-#include <map>
-#include <string>
-#include <vector>
+	int vsync_multiple = 1;
+	bool do_forever = false;
+	bool do_center = false;
+	bool do_shuffle = false;
 
-#include <Magick++.h>
-#include <magick/image.h>
+	RGBMatrix::Options matrix_options;
+	rgb_matrix::RuntimeOptions runtime_opt;
+	ImageParams img_param;
+	std::map<const void *, struct ImageParams> filename_params;
 
-using rgb_matrix::GPIO;
-using rgb_matrix::Canvas;
-using rgb_matrix::FrameCanvas;
-using rgb_matrix::RGBMatrix;
-using rgb_matrix::StreamReader;
+	const char *stream_output = NULL;
 
-// functions 
-static void InterruptHandler(int signo);
+	int argc = 0;
+	char **argv;
+	
+	bool fill_width = false;
+	bool fill_height = false;
 
-// MQTT 
-// globals
-const std::string SERVER_ADDRESS("tcp://iot.eclipse.org");
-const std::string CLIENT_ID("darkNinja");
-const std::string TOPIC("cthulhu");
-const int QOS = 1;
-const int N_RETRY_ATTEMPTS = 5;
+	rgb_matrix::StreamIO *stream_io = NULL;
+	rgb_matrix::StreamWriter *global_stream_writer = NULL;
 
-
-// ================================================ CLASSES ==============================================
-
-class action_listener : public virtual mqtt::iaction_listener
-{
-	std::string name_;
-
-	void on_failure(const mqtt::token& tok) override {
-		std::cout << name_ << " failure";
-		if (tok.get_message_id() != 0)
-			std::cout << " for token: [" << tok.get_message_id() << "]" << std::endl;
-		std::cout << std::endl;
-	}
-
-	void on_success(const mqtt::token& tok) override {
-		std::cout << name_ << " success";
-		if (tok.get_message_id() != 0)
-			std::cout << " for token: [" << tok.get_message_id() << "]" << std::endl;
-		auto top = tok.get_topics();
-		if (top && !top->empty())
-			std::cout << "\ttoken topic: '" << (*top)[0] << "', ..." << std::endl;
-		std::cout << std::endl;
-	}
-
-public:
-	action_listener(const std::string& name) : name_(name) {}
-};
-
-
-/**
- * Local callback & listener class for use with the client connection.
- * This is primarily intended to receive messages, but it will also monitor
- * the connection to the broker. If the connection is lost, it will attempt
- * to restore the connection and re-subscribe to the topic.
- */
-class callback : public virtual mqtt::callback,
-					public virtual mqtt::iaction_listener
-
-{
-	// Counter for the number of connection retries
-	int nretry_;
-	// The MQTT client
-	mqtt::async_client& cli_;
-	// Options to use if we need to reconnect
-	mqtt::connect_options& connOpts_;
-	// An action listener to display the result of actions.
-	action_listener subListener_;
-
-	// This deomonstrates manually reconnecting to the broker by calling
-	// connect() again. This is a possibility for an application that keeps
-	// a copy of it's original connect_options, or if the app wants to
-	// reconnect with different options.
-	// Another way this can be done manually, if using the same options, is
-	// to just call the async_client::reconnect() method.
-	void reconnect() {
-		std::this_thread::sleep_for(std::chrono::milliseconds(2500));
-		try {
-			cli_.connect(connOpts_, nullptr, *this);
-		}
-		catch (const mqtt::exception& exc) {
-			std::cerr << "Error: " << exc.what() << std::endl;
-			exit(1);
-		}
-	}
-
-	// Re-connection failure
-	void on_failure(const mqtt::token& tok) override {
-		std::cout << "Connection attempt failed" << std::endl;
-		if (++nretry_ > N_RETRY_ATTEMPTS)
-			exit(1);
-		reconnect();
-	}
-
-	// (Re)connection success
-	// Either this or connected() can be used for callbacks.
-	void on_success(const mqtt::token& tok) override {}
-
-	// (Re)connection success
-	void connected(const std::string& cause) override {
-		std::cout << "\nConnection success" << std::endl;
-		std::cout << "\nSubscribing to topic '" << TOPIC << "'\n"
-			<< "\tfor client " << CLIENT_ID
-			<< " using QoS" << QOS << "\n"
-			<< "\nPress Q<Enter> to quit\n" << std::endl;
-
-		cli_.subscribe(TOPIC, QOS, nullptr, subListener_);
-	}
-
-	// Callback for when the connection is lost.
-	// This will initiate the attempt to manually reconnect.
-	void connection_lost(const std::string& cause) override {
-		std::cout << "\nConnection lost" << std::endl;
-		if (!cause.empty())
-			std::cout << "\tcause: " << cause << std::endl;
-
-		std::cout << "Reconnecting..." << std::endl;
-		nretry_ = 0;
-		reconnect();
-	}
-
-	// Callback for when a message arrives.
-	void message_arrived(mqtt::const_message_ptr msg) override {
-		std::cout << "Message arrived" << std::endl;
-		std::cout << "\ttopic: '" << msg->get_topic() << "'" << std::endl;
-		std::cout << "\tpayload: '" << msg->to_string() << "'\n" << std::endl;
-		// change the data inside myfilename
-		//myfilename = msg->to_string();
-		//processImage(numberOfArgs, arguments);
-	}
-
-	void delivery_complete(mqtt::delivery_token_ptr token) override {}
-
-public:
-	callback(mqtt::async_client& cli, mqtt::connect_options& connOpts)
-				: nretry_(0), cli_(cli), connOpts_(connOpts), subListener_("Subscription") {}
-};
-
-
-typedef int64_t tmillis_t;
-static const tmillis_t distant_future = (1LL<<40); // that is a while.
-
-struct ImageParams {
-  ImageParams() : anim_duration_ms(distant_future), wait_ms(1500),
-                  anim_delay_ms(-1), loops(-1) {}
-  tmillis_t anim_duration_ms;  // If this is an animation, duration to show.
-  tmillis_t wait_ms;           // Regular image: duration to show.
-  tmillis_t anim_delay_ms;     // Animation delay override.
-  int loops;
-};
-
-struct FileInfo {
-  ImageParams params;      // Each file might have specific timing settings
-  bool is_multi_frame;
-  rgb_matrix::StreamIO *content_stream;
-};
-
-// ================================================ /CLASSES ==============================================
+	RGBMatrix *matrix = NULL;
+	FrameCanvas *offscreen_canvas = NULL;
+  	std::vector<FileInfo*> file_imgs;
+} state;
 
 volatile bool interrupt_received = false;
+
+
+int main(int argc, char* argv[]) 
+{
+	// copy argc and argv into state
+	state.argc = argc;
+	state.argv = static_cast<char **>(malloc((argc+1) * sizeof *argv));
+    for(int i = 0; i < argc; ++i)
+    {
+        size_t length = strlen(argv[i])+1;
+        state.argv[i] = static_cast<char *>(malloc(length));
+        memcpy(state.argv[i], argv[i], length);
+    }
+    state.argv[argc] = NULL;
+
+	// MQTT
+	// init mqtt
+	mqtt::connect_options connOpts;
+	connOpts.set_keep_alive_interval(20);
+	connOpts.set_clean_session(true);
+
+	mqtt::async_client client(SERVER_ADDRESS, CLIENT_ID);
+
+	callback cb(client, connOpts);
+	client.set_callback(cb);
+
+	// Start the connection.
+	// When completed, the callback will subscribe to topic.
+	try {
+		std::cout << "Connecting to the MQTT server..." << std::flush;
+		client.connect(connOpts, nullptr, cb);
+	}
+	catch (const mqtt::exception&) {
+		std::cerr << "\nERROR: Unable to connect to MQTT server: '"
+			<< SERVER_ADDRESS << "'" << std::endl;
+		return 1;
+	}
+
+	 signal(SIGTERM, InterruptHandler);
+  signal(SIGINT, InterruptHandler);
+	////////////////////////////////////////////////////////////////////////////////////////////////////////
+ 	Magick::InitializeMagick(*argv);
+
+	if (!rgb_matrix::ParseOptionsFromFlags(&argc, &argv, &state.matrix_options, &state.runtime_opt)) {
+		return usage(argv[0]);
+	}
+
+	setDefaultFilenameParams();
+	setImageParamsFromArgv(argc, argv); // sets on state.
+	setFilenameParamsFromImageParams();
+
+	// can't tell if there is a filename, don't forget to supply a filename
+	// TODO: do tell?
+
+    state.runtime_opt.do_gpio_init = (state.stream_output == NULL);
+  	state.matrix = CreateMatrixFromOptions(state.matrix_options, state.runtime_opt);
+	if (state.matrix == NULL) return 1;
+
+	state.offscreen_canvas = state.matrix->CreateFrameCanvas();
+
+  	printf("Size: %dx%d. Hardware gpio mapping: %s\n",
+         state.matrix->width(), state.matrix->height(), state.matrix_options.hardware_mapping);
+
+	if (state.stream_output) {
+		int fd = open(state.stream_output, O_CREAT|O_WRONLY, 0644);
+		if (fd < 0) {
+		  perror("Couldn't open output stream");
+		  return 1;
+		}
+		state.stream_io = new rgb_matrix::FileStreamIO(fd);
+		state.global_stream_writer = new rgb_matrix::StreamWriter(state.stream_io);
+	}
+
+	prepareImage("../img/1.png");
+	attachWaitTimeOnImage();
+	displayImage();
+
+	  if (interrupt_received) {
+		fprintf(stderr, "Caught signal. Exiting.\n");
+	  }
+
+  // Animation finished. Shut down the RGB matrix.
+  state.matrix->Clear();
+  delete state.matrix;
+
+	////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+	// MQTT
+	// Disconnect
+	try {
+		std::cout << "\nDisconnecting from the MQTT server..." << std::flush;
+		client.disconnect()->wait();
+		std::cout << "OK" << std::endl;
+	}
+	catch (const mqtt::exception& exc) {
+		std::cerr << exc.what() << std::endl;
+		return 1;
+	}
+
+
+	return 0;
+}
+
+void attachWaitTimeOnImage()
+{
+	// Some parameter sanity adjustments.
+	if (state.file_imgs.empty()) {
+		// e.g. if all files could not be interpreted as image.
+		fprintf(stderr, "No image could be loaded.\n");
+		exit(1);
+	} else if (state.file_imgs.size() == 1) {
+		// Single image: show forever.
+		state.file_imgs[0]->params.wait_ms = distant_future;
+	} else {
+		for (size_t i = 0; i < state.file_imgs.size(); ++i) {
+		  ImageParams &params = state.file_imgs[i]->params;
+		  // Forever animation ? Set to loop only once, otherwise that animation
+		  // would just run forever, stopping all the images after it.
+		  if (params.loops < 0 && params.anim_duration_ms == distant_future) {
+			params.loops = 1;
+		  }
+		}
+	}
+	return;
+}
+
+void prepareImage(std::string fname)
+{
+	const char *filename = fname.c_str();
+	FileInfo *file_info = NULL;
+
+	std::string err_msg;
+	std::vector<Magick::Image> image_sequence;
+	if (LoadImageAndScale(filename, state.matrix->width(), state.matrix->height(),
+						  state.fill_width, state.fill_height, &image_sequence, &err_msg)) {
+	  file_info = new FileInfo();
+	  file_info->params = state.filename_params[filename];
+	  file_info->content_stream = new rgb_matrix::MemStreamIO();
+	  file_info->is_multi_frame = image_sequence.size() > 1;
+	  rgb_matrix::StreamWriter out(file_info->content_stream);
+	  for (size_t i = 0; i < image_sequence.size(); ++i) {
+		const Magick::Image &img = image_sequence[i];
+		int64_t delay_time_us;
+		if (file_info->is_multi_frame) {
+		  delay_time_us = img.animationDelay() * 10000; // unit in 1/100s
+		} else {
+		  delay_time_us = file_info->params.wait_ms * 1000;  // single image.
+		}
+		if (delay_time_us <= 0) delay_time_us = 100 * 1000;  // 1/10sec
+		StoreInStream(img, delay_time_us, state.do_center, state.offscreen_canvas,
+					  state.global_stream_writer ? state.global_stream_writer : &out);
+	  }
+	} else {
+	  // Ok, not an image. Let's see if it is one of our streams.
+	  int fd = open(filename, O_RDONLY);
+	  if (fd >= 0) {
+		file_info = new FileInfo();
+		file_info->params = state.filename_params[filename];
+		file_info->content_stream = new rgb_matrix::FileStreamIO(fd);
+		StreamReader reader(file_info->content_stream);
+		if (reader.GetNext(state.offscreen_canvas, NULL)) {  // header+size ok
+		  file_info->is_multi_frame = reader.GetNext(state.offscreen_canvas, NULL);
+		  reader.Rewind();
+		  if (state.global_stream_writer) {
+			CopyStream(&reader, state.global_stream_writer, state.offscreen_canvas);
+		  }
+		} else {
+		  err_msg = "Can't read as image or compatible stream";
+		  delete file_info->content_stream;
+		  delete file_info;
+		  file_info = NULL;
+		}
+	  }
+	}
+	
+	if (file_info) {
+	  state.file_imgs.push_back(file_info);
+	} else {
+	  fprintf(stderr, "%s skipped: Unable to open (%s)\n", filename, err_msg.c_str());
+	}
+	return;
+}
+
+static void InterruptHandler(int signo) 
+{
+	interrupt_received = true;
+	return;
+}
+
+void setDefaultFilenameParams() 
+{
+	for (int i = 0; i < state.argc; ++i) {
+    	state.filename_params[state.argv[i]] = state.img_param;
+	}
+	return;
+}
+
+void setFilenameParamsFromImageParams() {
+	 // Starting from the current file, set all the remaining files to
+    // the latest change.
+    for (int i = optind; i < state.argc; ++i) {
+      state.filename_params[state.argv[i]] = state.img_param;
+    }
+}
+
+// TODO: Wire argv, argc from state
+void setImageParamsFromArgv(int argc, char* argv[])
+{
+	int opt;
+
+	while ((opt = getopt(argc, argv, "w:t:l:fr:c:P:LhCR:sO:V:D:")) != -1) {
+		switch (opt) {
+			case 'w':
+			  state.img_param.wait_ms = roundf(atof(optarg) * 1000.0f);
+			  break;
+			case 't':
+			  state.img_param.anim_duration_ms = roundf(atof(optarg) * 1000.0f);
+			  break;
+			case 'l':
+			  state.img_param.loops = atoi(optarg);
+			  break;
+			case 'D':
+			  state.img_param.anim_delay_ms = atoi(optarg);
+			  break;
+			case 'f':
+			  state.do_forever = true;
+			  break;
+			case 'C':
+			  state.do_center = true;
+			  break;
+			case 's':
+			  state.do_shuffle = true;
+			  break;
+			case 'r':
+			  state.matrix_options.rows = atoi(optarg);
+			  break;
+			case 'c':
+			  state.matrix_options.chain_length = atoi(optarg);
+			  break;
+			case 'P':
+			  state.matrix_options.parallel = atoi(optarg);
+			  break;
+			case 'O':
+			  state.stream_output = strdup(optarg);
+			  break;
+			case 'V':
+			  state.vsync_multiple = atoi(optarg);
+			  if (state.vsync_multiple < 1) state.vsync_multiple = 1;
+			  break;
+			case 'h':
+			default:
+			  usage(argv[0]);
+		}
+	}
+	return;
+}
+
+static int usage(const char *progname) {
+  fprintf(stderr, "usage: %s [options] <image> [option] [<image> ...]\n",
+          progname);
+
+  fprintf(stderr, "Options:\n"
+          "\t-O<streamfile>            : Output to stream-file instead of matrix (Don't need to be root).\n"
+          "\t-C                        : Center images.\n"
+
+          "\nThese options affect images following them on the command line:\n"
+          "\t-w<seconds>               : Regular image: "
+          "Wait time in seconds before next image is shown (default: 1.5).\n"
+          "\t-t<seconds>               : "
+          "For animations: stop after this time.\n"
+          "\t-l<loop-count>            : "
+          "For animations: number of loops through a full cycle.\n"
+          "\t-D<animation-delay-ms>    : "
+          "For animations: override the delay between frames given in the\n"
+          "\t                            gif/stream animation with this value. Use -1 to use default value.\n"
+
+          "\nOptions affecting display of multiple images:\n"
+          "\t-f                        : "
+          "Forever cycle through the list of files on the command line.\n"
+          "\t-s                        : If multiple images are given: shuffle.\n"
+          "\nDisplay Options:\n"
+          "\t-V<vsync-multiple>        : Expert: Only do frame vsync-swaps on multiples of refresh (default: 1)\n"
+          );
+
+  fprintf(stderr, "\nGeneral LED matrix options:\n");
+  rgb_matrix::PrintMatrixFlags(stderr);
+
+  fprintf(stderr,
+          "\nSwitch time between files: "
+          "-w for static images; -t/-l for animations\n"
+          "Animated gifs: If both -l and -t are given, "
+          "whatever finishes first determines duration.\n");
+
+  fprintf(stderr, "\nThe -w, -t and -l options apply to the following images "
+          "until a new instance of one of these options is seen.\n"
+          "So you can choose different durations for different images.\n");
+
+	exit(1);
+  return 1;
+}
 
 static tmillis_t GetTimeInMillis() {
   struct timeval tp;
   gettimeofday(&tp, NULL);
   return tp.tv_sec * 1000 + tp.tv_usec / 1000;
 }
-
 static void SleepMillis(tmillis_t milli_seconds) {
   if (milli_seconds <= 0) return;
   struct timespec ts;
@@ -310,300 +462,17 @@ void DisplayAnimation(const FileInfo *file,
   }
 }
 
-// all globals.
-static struct State {
-	tmillis_t start_load = GetTimeInMillis();
 
-	int vsync_multiple = 1;
-	bool do_forever = false;
-	bool do_center = false;
-	bool do_shuffle = false;
-
-	RGBMatrix::Options matrix_options;
-	rgb_matrix::RuntimeOptions runtime_opt;
-	ImageParams img_param;
-	std::map<const void *, struct ImageParams> filename_params;
-
-	const char *stream_output = NULL;
-
-	int argc = 0;
-	char **argv;
-	
-	bool fill_width = false;
-	bool fill_height = false;
-
-	rgb_matrix::StreamIO *stream_io = NULL;
-	rgb_matrix::StreamWriter *global_stream_writer = NULL;
-
-	RGBMatrix *matrix = NULL;
-	FrameCanvas *offscreen_canvas = NULL;
-  	std::vector<FileInfo*> file_imgs;
-} state;
-
-
-static int usage(const char *progname);
-void setImageParamsFromArgv(int argc, char* argv[], State state);
-void setDefaultFilenameParams(State state);
-void setFilenameParamsFromImageParams(State state); 
-
-// globals that cannot be put above everything.
-
-int main(int argc, char* argv[]) 
+void displayImage()
 {
-	// copy argc and argv into state
-	state.argc = argc;
-	state.argv = static_cast<char **>(malloc((argc+1) * sizeof *argv));
-    for(int i = 0; i < argc; ++i)
-    {
-        size_t length = strlen(argv[i])+1;
-        state.argv[i] = static_cast<char *>(malloc(length));
-        memcpy(state.argv[i], argv[i], length);
+  do {
+    if (state.do_shuffle) {
+      std::random_shuffle(state.file_imgs.begin(), state.file_imgs.end());
     }
-    state.argv[argc] = NULL;
-
-	////////////////////////////////////////////////////////////////////////////////////////////////////////
-	// MQTT
-	// init mqtt
-	mqtt::connect_options connOpts;
-	connOpts.set_keep_alive_interval(20);
-	connOpts.set_clean_session(true);
-
-	mqtt::async_client client(SERVER_ADDRESS, CLIENT_ID);
-
-	callback cb(client, connOpts);
-	client.set_callback(cb);
-
-	// Start the connection.
-	// When completed, the callback will subscribe to topic.
-	try {
-		std::cout << "Connecting to the MQTT server..." << std::flush;
-		client.connect(connOpts, nullptr, cb);
-	}
-	catch (const mqtt::exception&) {
-		std::cerr << "\nERROR: Unable to connect to MQTT server: '"
-			<< SERVER_ADDRESS << "'" << std::endl;
-		return 1;
-	}
-
-	
-	////////////////////////////////////////////////////////////////////////////////////////////////////////
- 	Magick::InitializeMagick(*argv);
-
-	if (!rgb_matrix::ParseOptionsFromFlags(&argc, &argv, &state.matrix_options, &state.runtime_opt)) {
-		return usage(argv[0]);
-	}
-
-	setDefaultFilenameParams(state);
-	setImageParamsFromArgv(argc, argv, state); // sets on state.
-	setFilenameParamsFromImageParams(state);
-
-	// can't tell if there is a filename, don't forget to supply a filename
-	// TODO: do tell?
-
-    state.runtime_opt.do_gpio_init = (state.stream_output == NULL);
-  	state.matrix = CreateMatrixFromOptions(state.matrix_options, state.runtime_opt);
-	if (state.matrix == NULL) return 1;
-
-	state.offscreen_canvas = state.matrix->CreateFrameCanvas();
-
-  	printf("Size: %dx%d. Hardware gpio mapping: %s\n",
-         state.matrix->width(), state.matrix->height(), state.matrix_options.hardware_mapping);
-
-	if (stream_output) {
-		int fd = open(stream_output, O_CREAT|O_WRONLY, 0644);
-		if (fd < 0) {
-		  perror("Couldn't open output stream");
-		  return 1;
-		}
-		stream_io = new rgb_matrix::FileStreamIO(fd);
-		global_stream_writer = new rgb_matrix::StreamWriter(stream_io);
-	}
-
-	prepareImages();
-	////////////////////////////////////////////////////////////////////////////////////////////////////////
-	// MQTT
-	// Disconnect
-	try {
-		std::cout << "\nDisconnecting from the MQTT server..." << std::flush;
-		client.disconnect()->wait();
-		std::cout << "OK" << std::endl;
-	}
-	catch (const mqtt::exception& exc) {
-		std::cerr << exc.what() << std::endl;
-		return 1;
-	}
-
-
-	return 0;
-}
-
-void prepareImage(std::string fname)
-{
-	const char *filename = fname.c_str();
-	FileInfo *file_info = NULL;
-
-	std::string err_msg;
-	std::vector<Magick::Image> image_sequence;
-	if (LoadImageAndScale(filename, state.matrix->width(), state.matrix->height(),
-						  fill_width, fill_height, &image_sequence, &err_msg)) {
-	  file_info = new FileInfo();
-	  file_info->params = filename_params[filename];
-	  file_info->content_stream = new rgb_matrix::MemStreamIO();
-	  file_info->is_multi_frame = image_sequence.size() > 1;
-	  rgb_matrix::StreamWriter out(file_info->content_stream);
-	  for (size_t i = 0; i < image_sequence.size(); ++i) {
-		const Magick::Image &img = image_sequence[i];
-		int64_t delay_time_us;
-		if (file_info->is_multi_frame) {
-		  delay_time_us = img.animationDelay() * 10000; // unit in 1/100s
-		} else {
-		  delay_time_us = file_info->params.wait_ms * 1000;  // single image.
-		}
-		if (delay_time_us <= 0) delay_time_us = 100 * 1000;  // 1/10sec
-		StoreInStream(img, delay_time_us, state.do_center, state.offscreen_canvas,
-					  global_stream_writer ? global_stream_writer : &out);
-	  }
-	} else {
-	  // Ok, not an image. Let's see if it is one of our streams.
-	  int fd = open(filename, O_RDONLY);
-	  if (fd >= 0) {
-		file_info = new FileInfo();
-		file_info->params = filename_params[filename];
-		file_info->content_stream = new rgb_matrix::FileStreamIO(fd);
-		StreamReader reader(file_info->content_stream);
-		if (reader.GetNext(offscreen_canvas, NULL)) {  // header+size ok
-		  file_info->is_multi_frame = reader.GetNext(offscreen_canvas, NULL);
-		  reader.Rewind();
-		  if (global_stream_writer) {
-			CopyStream(&reader, global_stream_writer, offscreen_canvas);
-		  }
-		} else {
-		  err_msg = "Can't read as image or compatible stream";
-		  delete file_info->content_stream;
-		  delete file_info;
-		  file_info = NULL;
-		}
-	  }
-	}
-
-	return;
-}
-
-static void InterruptHandler(int signo) 
-{
-	interrupt_received = true;
-	return;
-}
-
-void setDefaultFilenameParams(State state) 
-{
-	for (int i = 0; i < state.argc; ++i) {
-    	state.filename_params[state.argv[i]] = state.img_param;
-	}
-	return;
-}
-
-void setFilenameParamsFromImageParams(State state) {
-	 // Starting from the current file, set all the remaining files to
-    // the latest change.
-    for (int i = optind; i < state.argc; ++i) {
-      state.filename_params[state.argv[i]] = state.img_param;
+    for (size_t i = 0; i < state.file_imgs.size() && !interrupt_received; ++i) {
+      DisplayAnimation(state.file_imgs[i], state.matrix, state.offscreen_canvas, state.vsync_multiple);
     }
+  } while (state.do_forever && !interrupt_received);
+
+  return;
 }
-
-// TODO: Wire argv, argc from state
-void setImageParamsFromArgv(int argc, char* argv[], State state)
-{
-	int opt;
-
-	while ((opt = getopt(argc, argv, "w:t:l:fr:c:P:LhCR:sO:V:D:")) != -1) {
-		switch (opt) {
-			case 'w':
-			  state.img_param.wait_ms = roundf(atof(optarg) * 1000.0f);
-			  break;
-			case 't':
-			  state.img_param.anim_duration_ms = roundf(atof(optarg) * 1000.0f);
-			  break;
-			case 'l':
-			  state.img_param.loops = atoi(optarg);
-			  break;
-			case 'D':
-			  state.img_param.anim_delay_ms = atoi(optarg);
-			  break;
-			case 'f':
-			  state.do_forever = true;
-			  break;
-			case 'C':
-			  state.do_center = true;
-			  break;
-			case 's':
-			  state.do_shuffle = true;
-			  break;
-			case 'r':
-			  state.matrix_options.rows = atoi(optarg);
-			  break;
-			case 'c':
-			  state.matrix_options.chain_length = atoi(optarg);
-			  break;
-			case 'P':
-			  state.matrix_options.parallel = atoi(optarg);
-			  break;
-			case 'O':
-			  state.stream_output = strdup(optarg);
-			  break;
-			case 'V':
-			  state.vsync_multiple = atoi(optarg);
-			  if (state.vsync_multiple < 1) state.vsync_multiple = 1;
-			  break;
-			case 'h':
-			default:
-			  usage(argv[0]);
-		}
-	}
-	return;
-}
-
-static int usage(const char *progname) {
-  fprintf(stderr, "usage: %s [options] <image> [option] [<image> ...]\n",
-          progname);
-
-  fprintf(stderr, "Options:\n"
-          "\t-O<streamfile>            : Output to stream-file instead of matrix (Don't need to be root).\n"
-          "\t-C                        : Center images.\n"
-
-          "\nThese options affect images following them on the command line:\n"
-          "\t-w<seconds>               : Regular image: "
-          "Wait time in seconds before next image is shown (default: 1.5).\n"
-          "\t-t<seconds>               : "
-          "For animations: stop after this time.\n"
-          "\t-l<loop-count>            : "
-          "For animations: number of loops through a full cycle.\n"
-          "\t-D<animation-delay-ms>    : "
-          "For animations: override the delay between frames given in the\n"
-          "\t                            gif/stream animation with this value. Use -1 to use default value.\n"
-
-          "\nOptions affecting display of multiple images:\n"
-          "\t-f                        : "
-          "Forever cycle through the list of files on the command line.\n"
-          "\t-s                        : If multiple images are given: shuffle.\n"
-          "\nDisplay Options:\n"
-          "\t-V<vsync-multiple>        : Expert: Only do frame vsync-swaps on multiples of refresh (default: 1)\n"
-          );
-
-  fprintf(stderr, "\nGeneral LED matrix options:\n");
-  rgb_matrix::PrintMatrixFlags(stderr);
-
-  fprintf(stderr,
-          "\nSwitch time between files: "
-          "-w for static images; -t/-l for animations\n"
-          "Animated gifs: If both -l and -t are given, "
-          "whatever finishes first determines duration.\n");
-
-  fprintf(stderr, "\nThe -w, -t and -l options apply to the following images "
-          "until a new instance of one of these options is seen.\n"
-          "So you can choose different durations for different images.\n");
-
-	exit(1);
-  return 1;
-}
-
