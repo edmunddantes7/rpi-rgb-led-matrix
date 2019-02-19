@@ -28,6 +28,9 @@ $(RGB_LIBRARY): FORCE
 led-imager: led-imager.o $(RGB_LIBRARY)
 	$(CXX) $(CXXFLAGS) led-imager.o -o $@ $(LDFLAGS) $(MAGICK_LDFLAGS) $(DEBUGFLAGS)
 
+led-snake: led-snake.o $(RGB_LIBRARY)
+	$(CXX) $(CXXFLAGS) led-snake.o -o $@ $(LDFLAGS) $(MAGICK_LDFLAGS) $(DEBUGFLAGS)
+
 led-image-viewer: led-image-viewer.o $(RGB_LIBRARY)
 	$(CXX) $(CXXFLAGS) led-image-viewer.o -o $@ $(LDFLAGS) $(MAGICK_LDFLAGS) $(DEBUGFLAGS)
 

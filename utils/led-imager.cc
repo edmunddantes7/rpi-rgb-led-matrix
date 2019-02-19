@@ -1,37 +1,5 @@
 #include "ActionListener.h"
 
-// all globals.
-static struct State {
-	tmillis_t start_load = GetTimeInMillis();
-
-	int vsync_multiple = 1;
-	bool do_forever = false;
-	bool do_center = false;
-	bool do_shuffle = false;
-
-	RGBMatrix::Options matrix_options;
-	rgb_matrix::RuntimeOptions runtime_opt;
-	ImageParams img_param;
-	std::map<const void *, struct ImageParams> filename_params;
-
-	const char *stream_output = NULL;
-
-	int argc = 0;
-	char **argv;
-	
-	bool fill_width = false;
-	bool fill_height = false;
-
-	rgb_matrix::StreamIO *stream_io = NULL;
-	rgb_matrix::StreamWriter *global_stream_writer = NULL;
-
-	RGBMatrix *matrix = NULL;
-	FrameCanvas *offscreen_canvas = NULL;
-  	std::vector<FileInfo*> file_imgs;
-} state;
-
-volatile bool interrupt_received = false;
-
 
 int main(int argc, char* argv[]) 
 {
@@ -94,21 +62,11 @@ int main(int argc, char* argv[])
   	printf("Size: %dx%d. Hardware gpio mapping: %s\n",
          state.matrix->width(), state.matrix->height(), state.matrix_options.hardware_mapping);
 
-	if (state.stream_output) {
-		int fd = open(state.stream_output, O_CREAT|O_WRONLY, 0644);
-		if (fd < 0) {
-		  perror("Couldn't open output stream");
-		  return 1;
-		}
-		state.stream_io = new rgb_matrix::FileStreamIO(fd);
-		state.global_stream_writer = new rgb_matrix::StreamWriter(state.stream_io);
-	}
-
-	prepareImage("../img/1.png");
+	prepareImage(state.imageFilename);
 	attachWaitTimeOnImage();
-	displayImage();
+	displayImage(state.imageFilename);
 
-	  if (interrupt_received) {
+	  if (state.interrupt_received) {
 		fprintf(stderr, "Caught signal. Exiting.\n");
 	  }
 
@@ -216,7 +174,7 @@ void prepareImage(std::string fname)
 
 static void InterruptHandler(int signo) 
 {
-	interrupt_received = true;
+	state.interrupt_received = true;
 	return;
 }
 
@@ -433,46 +391,74 @@ static bool LoadImageAndScale(const char *filename,
   return true;
 }
 
-void DisplayAnimation(const FileInfo *file,
-                      RGBMatrix *matrix, FrameCanvas *offscreen_canvas,
-                      int vsync_multiple) {
-  const tmillis_t duration_ms = (file->is_multi_frame
+void DisplayAnimation() {	
+	FileInfo *file;
+	RGBMatrix *matrix;
+	FrameCanvas *offscreen_canvas;
+	int vsync_multiple;
+
+	tmillis_t duration_ms;
+	int loops;
+	tmillis_t end_time_ms;
+	tmillis_t override_anim_delay;
+
+start:
+	// state.file_imgs[i], state.matrix, state.offscreen_canvas, state.vsync_multiple
+	file = state.file_imgs[0];
+	matrix = state.matrix;
+	offscreen_canvas = state.offscreen_canvas;
+	vsync_multiple = state.vsync_multiple;
+
+  duration_ms = (file->is_multi_frame
                                  ? file->params.anim_duration_ms
                                  : file->params.wait_ms);
   rgb_matrix::StreamReader reader(file->content_stream);
-  int loops = file->params.loops;
-  const tmillis_t end_time_ms = GetTimeInMillis() + duration_ms;
-  const tmillis_t override_anim_delay = file->params.anim_delay_ms;
+  loops = file->params.loops;
+  end_time_ms = GetTimeInMillis() + duration_ms;
+  override_anim_delay = file->params.anim_delay_ms;
+	loops = 2000; // override
+
   for (int k = 0;
-       (loops < 0 || k < loops)
-         && !interrupt_received
+				(loops < 0 || k < loops)
+         && !state.interrupt_received
          && GetTimeInMillis() < end_time_ms;
-       ++k) {
+			 ++k) {
+		if (state.mqtt_message_received) {
+			state.mqtt_message_received = false;
+			goto start;
+		}
     uint32_t delay_us = 0;
-    while (!interrupt_received && GetTimeInMillis() <= end_time_ms
+    while (!state.interrupt_received && GetTimeInMillis() <= end_time_ms
            && reader.GetNext(offscreen_canvas, &delay_us)) {
       const tmillis_t anim_delay_ms =
         override_anim_delay >= 0 ? override_anim_delay : delay_us / 1000;
       const tmillis_t start_wait_ms = GetTimeInMillis();
       offscreen_canvas = matrix->SwapOnVSync(offscreen_canvas, vsync_multiple);
       const tmillis_t time_already_spent = GetTimeInMillis() - start_wait_ms;
-      SleepMillis(anim_delay_ms - time_already_spent);
-    }
+      SleepMillis(anim_delay_ms - time_already_spent);			
+    }		
     reader.Rewind();
   }
 }
 
-
-void displayImage()
+void displayImage(std::string displayImageSlugName)
 {
   do {
     if (state.do_shuffle) {
       std::random_shuffle(state.file_imgs.begin(), state.file_imgs.end());
     }
-    for (size_t i = 0; i < state.file_imgs.size() && !interrupt_received; ++i) {
-      DisplayAnimation(state.file_imgs[i], state.matrix, state.offscreen_canvas, state.vsync_multiple);
+    for (size_t i = 0; i < state.file_imgs.size() && !state.interrupt_received; ++i) {
+      DisplayAnimation();
     }
-  } while (state.do_forever && !interrupt_received);
+  } while (state.do_forever && !state.interrupt_received);
 
   return;
+}
+
+void updateImage()
+{
+	prepareImage(state.imageFilename);
+	attachWaitTimeOnImage();
+	displayImage(state.imageFilename);
+	return;
 }

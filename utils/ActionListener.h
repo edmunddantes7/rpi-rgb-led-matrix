@@ -107,8 +107,9 @@ class callback : public virtual mqtt::callback,
 		std::cout << "\ttopic: '" << msg->get_topic() << "'" << std::endl;
 		std::cout << "\tpayload: '" << msg->to_string() << "'\n" << std::endl;
 		// change the data inside myfilename
-		//myfilename = msg->to_string();
-		//processImage(numberOfArgs, arguments);
+	    state.imageFilename = msg->to_string();	
+		updateImage();
+		state.mqtt_message_received = true;
 	}
 
 	void delivery_complete(mqtt::delivery_token_ptr token) override {}
@@ -117,8 +118,6 @@ public:
 	callback(mqtt::async_client& cli, mqtt::connect_options& connOpts)
 				: nretry_(0), cli_(cli), connOpts_(connOpts), subListener_("Subscription") {}
 };
-
-
 
 
 #endif
